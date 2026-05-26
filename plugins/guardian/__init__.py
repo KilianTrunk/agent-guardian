@@ -11,6 +11,10 @@ import logging
 import os
 import queue
 import re
+import shlex
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -23,6 +27,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_DAEMON_URL = "http://127.0.0.1:9200"
 _MAX_QUEUE = 1000
 _MAX_TEXT = 2000
+_SUPERVISOR_ID = os.environ.get("GUARDIAN_SUPERVISOR_ID", "")
 _SECRET_KEY_RE = re.compile(
     r"(api[_-]?key|token|secret|password|passwd|credential|authorization|private[_-]?key)",
     re.IGNORECASE,
@@ -204,15 +209,23 @@ def _post_event(event: Dict[str, Any]) -> None:
 
 
 def _base_event(event_type: str, **kwargs: Any) -> Dict[str, Any]:
-    return {
+    instance_id = os.environ.get("GUARDIAN_AGENT_INSTANCE_ID") or _SUPERVISOR_ID or f"hermes-{os.getpid()}"
+    agent_name = os.environ.get("GUARDIAN_AGENT_NAME") or "Hermes"
+    event = {
         "type": event_type,
         "occurredAt": int(time.time() * 1000),
         "sourceAgent": {
             "framework": "hermes",
-            "name": "Hermes",
+            "name": agent_name,
+            "instanceId": instance_id,
         },
         **kwargs,
     }
+    if _SUPERVISOR_ID:
+        event.setdefault("metadata", {})
+        if isinstance(event["metadata"], dict):
+            event["metadata"]["guardianSupervisorId"] = _SUPERVISOR_ID
+    return event
 
 
 def _on_pre_tool_call(
@@ -339,6 +352,141 @@ def _on_session_end(session_id: str = "", completed: bool = True, interrupted: b
     ))
 
 
+def _post_supervisor_event(event: Dict[str, Any]) -> None:
+    try:
+        _post_event(event)
+    except Exception as exc:
+        logger.debug("Guardian supervisor event dropped: %s", exc)
+
+
+def _setup_cli(parser) -> None:
+    subparsers = parser.add_subparsers(dest="guardian_command")
+
+    run_hermes = subparsers.add_parser(
+        "run-hermes",
+        help="Launch a child Hermes agent under Guardian audit",
+        description=(
+            "Start a supervised child Hermes agent with isolated HERMES_HOME "
+            "and forced Guardian telemetry. The child writes audit events to "
+            "the configured DKG daemon while this parent records launch/exit "
+            "supervisor events."
+        ),
+    )
+    run_hermes.add_argument("--query", required=True, help="Prompt for the child Hermes agent")
+    run_hermes.add_argument("--workdir", default=os.getcwd(), help="Working directory for the child agent")
+    run_hermes.add_argument("--child-home", default="", help="Existing HERMES_HOME for the child; defaults to a temp directory")
+    run_hermes.add_argument("--keep-home", action="store_true", help="Do not delete an auto-created child HERMES_HOME")
+    run_hermes.add_argument("--dkg-url", default="", help="DKG daemon URL; defaults to plugin discovery rules")
+    run_hermes.add_argument("--model", default="gpt-4o-mini", help="OpenAI-compatible model for the child")
+    run_hermes.add_argument("--base-url", default="https://api.openai.com/v1", help="OpenAI-compatible base URL")
+    run_hermes.add_argument("--api-mode", default="chat_completions", help="Child Hermes API mode")
+    run_hermes.add_argument("--max-turns", type=int, default=6, help="Maximum child tool/API iterations")
+    run_hermes.add_argument("--enabled-toolsets", default="terminal,file", help="Comma-separated child toolsets")
+    run_hermes.add_argument("--disabled-toolsets", default="", help="Comma-separated child disabled toolsets")
+    run_hermes.add_argument("--api-key-env", default="OPENAI_API_KEY", help="Environment variable containing the child model API key")
+    run_hermes.set_defaults(func=_cmd_run_hermes)
+
+
+def _cmd_run_hermes(args) -> int:
+    """Launch a supervised child Hermes process.
+
+    This is the agent-to-agent audit path: the Guardian parent owns the child
+    runtime environment and forces the child to emit Guardian audit events.
+    """
+    supervisor_id = f"guardian-supervisor-{int(time.time())}-{os.getpid()}"
+    daemon_url = (args.dkg_url or _load_daemon_url()).rstrip("/")
+    child_home = Path(args.child_home).expanduser() if args.child_home else Path(tempfile.mkdtemp(prefix="guardian-hermes-child-"))
+    auto_home = not bool(args.child_home)
+    child_home.mkdir(parents=True, exist_ok=True)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env.update({
+        "HERMES_HOME": str(child_home),
+        "HERMES_GUARDIAN_ENABLED": "1",
+        "GUARDIAN_SUPERVISOR_ID": supervisor_id,
+        "GUARDIAN_AGENT_INSTANCE_ID": f"{supervisor_id}:hermes-child",
+        "GUARDIAN_AGENT_NAME": "Hermes child",
+        "DKG_DAEMON_URL": daemon_url,
+        "GUARDIAN_DKG_DAEMON_URL": daemon_url,
+        "HERMES_ENABLE_PROJECT_PLUGINS": env.get("HERMES_ENABLE_PROJECT_PLUGINS", "0"),
+    })
+    if args.api_key_env and args.api_key_env in os.environ:
+        env["OPENAI_API_KEY"] = os.environ[args.api_key_env]
+
+    child_spec = {
+        "query": args.query,
+        "base_url": args.base_url,
+        "api_mode": args.api_mode,
+        "model": args.model,
+        "max_turns": args.max_turns,
+        "enabled_toolsets": [p.strip() for p in args.enabled_toolsets.split(",") if p.strip()],
+        "disabled_toolsets": [p.strip() for p in args.disabled_toolsets.split(",") if p.strip()],
+    }
+    env["GUARDIAN_CHILD_SPEC"] = json.dumps(child_spec)
+    child_code = (
+        "import json, os, sys\n"
+        "from run_agent import AIAgent\n"
+        "spec=json.loads(os.environ['GUARDIAN_CHILD_SPEC'])\n"
+        "agent=AIAgent(base_url=spec['base_url'], api_key=os.environ.get('OPENAI_API_KEY'), "
+        "api_mode=spec['api_mode'], model=spec['model'], max_iterations=int(spec['max_turns']), "
+        "enabled_toolsets=spec['enabled_toolsets'] or None, "
+        "disabled_toolsets=spec['disabled_toolsets'] or None, "
+        "skip_memory=True, skip_context_files=True, quiet_mode=True)\n"
+        "result=agent.run_conversation(spec['query'])\n"
+        "print(result.get('final_response') or '')\n"
+        "sys.exit(0 if result.get('completed') else 1)\n"
+    )
+    cmd = [sys.executable, "-c", child_code]
+
+    _post_supervisor_event({
+        "type": "agent_activity",
+        "idempotencyKey": f"{supervisor_id}:launch",
+        "occurredAt": int(time.time() * 1000),
+        "sourceAgent": {"framework": "guardian", "name": "Guardian Supervisor", "instanceId": supervisor_id},
+        "title": "Guardian launched child Hermes agent",
+        "summary": "A child Hermes process was started under Guardian audit.",
+        "data": {
+            "childFramework": "hermes",
+            "childHome": str(child_home),
+            "workdir": str(Path(args.workdir).expanduser()),
+            "model": args.model,
+            "baseUrl": args.base_url,
+            "apiMode": args.api_mode,
+            "enabledToolsets": args.enabled_toolsets,
+            "command": " ".join(shlex.quote(part) for part in [sys.executable, "-c", "<guardian-child-runner>"]),
+        },
+    })
+
+    print(f"Guardian supervisor: {supervisor_id}")
+    print(f"Child HERMES_HOME: {child_home}")
+    print(f"DKG daemon: {daemon_url}")
+    proc = subprocess.run(cmd, cwd=str(Path(args.workdir).expanduser()), env=env, text=True)
+
+    _post_supervisor_event({
+        "type": "agent_activity",
+        "idempotencyKey": f"{supervisor_id}:exit:{proc.returncode}",
+        "occurredAt": int(time.time() * 1000),
+        "sourceAgent": {"framework": "guardian", "name": "Guardian Supervisor", "instanceId": supervisor_id},
+        "severity": "info" if proc.returncode == 0 else "medium",
+        "title": "Guardian child Hermes agent exited",
+        "summary": f"Child Hermes process exited with code {proc.returncode}.",
+        "data": {
+            "childFramework": "hermes",
+            "childHome": str(child_home),
+            "returnCode": proc.returncode,
+        },
+    })
+
+    if auto_home and not args.keep_home:
+        try:
+            import shutil
+            shutil.rmtree(child_home, ignore_errors=True)
+        except Exception:
+            pass
+    return int(proc.returncode or 0)
+
+
 def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
@@ -346,3 +494,8 @@ def register(ctx) -> None:
     ctx.register_hook("post_api_request", _on_post_api_request)
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_end", _on_session_end)
+    ctx.register_cli_command(
+        "guardian",
+        "Launch and inspect Guardian-supervised child agents",
+        _setup_cli,
+    )

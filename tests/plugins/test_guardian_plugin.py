@@ -30,10 +30,14 @@ def _load_guardian_plugin():
 def test_guardian_plugin_registers_expected_hooks():
     mod = _load_guardian_plugin()
     calls = []
+    cli = []
 
     class Ctx:
         def register_hook(self, name, fn):
             calls.append((name, fn))
+
+        def register_cli_command(self, name, help, setup_fn, handler_fn=None, description=""):
+            cli.append((name, help, setup_fn, handler_fn, description))
 
     mod.register(Ctx())
     assert [name for name, _ in calls] == [
@@ -44,6 +48,8 @@ def test_guardian_plugin_registers_expected_hooks():
         "on_session_start",
         "on_session_end",
     ]
+    assert cli[0][0] == "guardian"
+    assert callable(cli[0][2])
 
 
 def test_guardian_tool_hook_enqueues_redacted_event(monkeypatch):
@@ -73,6 +79,7 @@ def test_guardian_tool_hook_enqueues_redacted_event(monkeypatch):
     event = events[0]
     assert event["type"] == "tool_call"
     assert event["sourceAgent"]["framework"] == "hermes"
+    assert event["sourceAgent"]["instanceId"]
     assert event["sessionId"] == "session-1"
     assert event["data"]["args"]["api_key"] == "[REDACTED]"
     assert event["data"]["args"]["Authorization"] == "[REDACTED]"
@@ -96,3 +103,51 @@ def test_guardian_enqueue_fails_open_when_queue_is_full(monkeypatch):
         session_id="session-1",
         tool_call_id="call-1",
     )
+
+
+def test_guardian_supervisor_launches_child_with_isolated_env(monkeypatch, tmp_path):
+    mod = _load_guardian_plugin()
+    posted = []
+    ran = {}
+
+    class Args:
+        query = "say hello"
+        workdir = str(tmp_path)
+        child_home = str(tmp_path / "child-home")
+        keep_home = True
+        dkg_url = "http://127.0.0.1:9200"
+        model = "gpt-4o-mini"
+        base_url = "https://api.openai.com/v1"
+        api_mode = "chat_completions"
+        max_turns = 2
+        enabled_toolsets = "terminal,file"
+        disabled_toolsets = ""
+        api_key_env = "OPENAI_API_KEY"
+
+    class Completed:
+        returncode = 0
+
+    def fake_run(cmd, cwd, env, text):
+        ran["cmd"] = cmd
+        ran["cwd"] = cwd
+        ran["env"] = env
+        return Completed()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-secret")
+    monkeypatch.setattr(mod, "_post_supervisor_event", lambda event: posted.append(event))
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+
+    rc = mod._cmd_run_hermes(Args())
+
+    assert rc == 0
+    assert len(posted) == 2
+    assert posted[0]["sourceAgent"]["framework"] == "guardian"
+    assert posted[0]["data"]["command"] == f"{mod.sys.executable} -c '<guardian-child-runner>'"
+    assert ran["cwd"] == str(tmp_path)
+    assert ran["env"]["HERMES_HOME"] == str(tmp_path / "child-home")
+    assert ran["env"]["HERMES_GUARDIAN_ENABLED"] == "1"
+    assert ran["env"]["GUARDIAN_AGENT_INSTANCE_ID"].endswith(":hermes-child")
+    assert ran["env"]["GUARDIAN_AGENT_NAME"] == "Hermes child"
+    assert ran["env"]["GUARDIAN_DKG_DAEMON_URL"] == "http://127.0.0.1:9200"
+    assert ran["env"]["OPENAI_API_KEY"] == "sk-test-secret"
+    assert "sk-test-secret" not in " ".join(ran["cmd"])

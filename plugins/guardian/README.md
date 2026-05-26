@@ -1,8 +1,9 @@
 # guardian
 
-Observational Hermes audit plugin for Umanitek Guardian. The plugin streams
-Hermes session, model, and tool activity to the local DKG daemon so the DKG UI
-can show live agent-risk findings without blocking the agent.
+Observational Hermes audit and supervisor plugin for Umanitek Guardian. The
+plugin can launch child Hermes agents under audit and streams their session,
+model, and tool activity to the local DKG daemon so the DKG UI can show live
+agent-risk findings without blocking the child agent.
 
 ## Scope
 
@@ -16,7 +17,35 @@ Guardian V1 is audit-only. It records enough structured metadata to detect:
 - vulnerable dependency intelligence enriched by the DKG daemon
 
 The plugin does not quarantine, block, or modify tool calls. All transport
-errors are fail-open so Hermes continues running if DKG is unavailable.
+errors are fail-open so supervised child agents continue running if DKG is
+unavailable.
+
+## Supervisor Mode
+
+Guardian should own the launch path for agents it protects. Use the plugin CLI
+to start a child Hermes process with an isolated `HERMES_HOME` and forced
+Guardian telemetry:
+
+```bash
+OPENAI_API_KEY=... hermes guardian run-hermes \
+  --query "Inspect package httpx==0.28.1, then run: python -m pip install httpx==0.28.1" \
+  --workdir "${TMPDIR:-/tmp}/guardian-agent-workspace" \
+  --dkg-url http://127.0.0.1:9200 \
+  --model gpt-4o-mini \
+  --api-mode chat_completions \
+  --enabled-toolsets terminal,file
+```
+
+This parent process records Guardian supervisor launch/exit events, then the
+child Hermes process records tool/API/session events through the same plugin
+hooks. The API key stays in the child process environment; it is not placed in
+the command line.
+
+V1 can audit other agents only when Guardian starts them or when their runtime
+loads a Guardian-aware adapter. It cannot observe arbitrary already-running
+Cursor, Codex, Hermes, or OpenClaw processes unless they are launched through a
+supervised path, routed through an audited MCP/proxy layer, or instrumented with
+compatible hooks.
 
 ## Hook Coverage
 
@@ -64,7 +93,7 @@ If no URL env var is set, the plugin also checks
 From the repository root:
 
 ```bash
-cd /Users/kiliantrunk/Projects/umanitek/agent-guardian/dkg
+cd dkg
 corepack prepare pnpm@10.28.1 --activate
 pnpm install --frozen-lockfile
 pnpm build
@@ -72,19 +101,23 @@ cd packages/cli
 node ./scripts/bundle-markitdown-binaries.mjs --build-current-platform
 pnpm link --global --filter @origintrail-official/dkg
 
-cd /Users/kiliantrunk/Projects/umanitek/agent-guardian
+cd ../../..
 source .venv/bin/activate
 dkg hermes setup
 echo 'API_SERVER_ENABLED=true' >> ~/.hermes/.env
 hermes gateway run --replace -v
 ```
 
-Open the DKG UI at `http://127.0.0.1:9200/ui`. Guardian is the default tab.
+`dkg hermes setup` configures Hermes to reach the local DKG daemon. After a
+supervised agent runs, Hermes emits events to `/api/guardian/events`, the DKG UI
+shows protected-agent status, and private audit events are written to the local
+Guardian graph. Open the DKG UI at `http://127.0.0.1:9200/ui`; Guardian is the
+default tab.
 
 For monorepo daemon development, prefer running the built local CLI with:
 
 ```bash
-cd /Users/kiliantrunk/Projects/umanitek/agent-guardian/dkg
+cd dkg
 DKG_NO_BLUE_GREEN=1 node packages/cli/dist/cli.js start --foreground
 ```
 
