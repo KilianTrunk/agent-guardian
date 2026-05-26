@@ -1,0 +1,12 @@
+name: guardian
+kind: platform
+version: 1.0.0
+description: "Streams Hermes tool and model activity to Umanitek Guardian."
+author: "Umanitek"
+hooks:
+  - pre_tool_call
+  - post_tool_call
+  - pre_api_request
+  - post_api_request
+  - on_session_start
+  - on_session_end
