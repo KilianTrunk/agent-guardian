@@ -47,6 +47,22 @@ Cursor, Codex, Hermes, or OpenClaw processes unless they are launched through a
 supervised path, routed through an audited MCP/proxy layer, or instrumented with
 compatible hooks.
 
+## How Users Connect Agents
+
+The root repository README is the canonical production setup tutorial. In short:
+
+1. Clone with submodules:
+   ```bash
+   git clone --recurse-submodules https://github.com/KilianTrunk/agent-guardian.git
+   ```
+2. Start the DKG daemon from `agent-guardian/dkg`.
+3. Observe Hermes by launching the child through `hermes guardian run-hermes`.
+4. Observe OpenClaw by running `dkg openclaw setup` or using the DKG UI
+   **Connect OpenClaw** button, then restarting/reloading OpenClaw.
+
+If a Hermes/OpenClaw process is started normally without those steps, Guardian
+does not see it.
+
 ## Hook Coverage
 
 | Hook | Event type | Notes |
@@ -94,9 +110,11 @@ From the repository root:
 
 ```bash
 cd dkg
+corepack enable
 corepack prepare pnpm@10.28.1 --activate
 pnpm install --frozen-lockfile
 pnpm build
+pnpm --filter @origintrail-official/dkg-node-ui build:ui
 cd packages/cli
 node ./scripts/bundle-markitdown-binaries.mjs --build-current-platform
 pnpm link --global --filter @origintrail-official/dkg
