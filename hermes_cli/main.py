@@ -10758,7 +10758,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
     {
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
-        "config", "cron", "curator", "dashboard", "debug", "doctor",
+        "config", "cron", "curator", "dashboard", "debug", "dkg", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
         "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
@@ -12649,6 +12649,13 @@ Examples:
 
             seen_plugin_commands = set()
             for cmd_info in discover_plugin_cli_commands():
+                if cmd_info["name"] in _BUILTIN_SUBCOMMANDS or cmd_info["name"] in subparsers.choices:
+                    logging.getLogger(__name__).debug(
+                        "Skipping plugin CLI command '%s' because a subcommand "
+                        "with that name already exists",
+                        cmd_info["name"],
+                    )
+                    continue
                 plugin_parser = subparsers.add_parser(
                     cmd_info["name"],
                     help=cmd_info["help"],
@@ -12662,6 +12669,13 @@ Examples:
 
             discover_plugins()
             for cmd_info in get_plugin_manager()._cli_commands.values():
+                if cmd_info["name"] in _BUILTIN_SUBCOMMANDS or cmd_info["name"] in subparsers.choices:
+                    logging.getLogger(__name__).debug(
+                        "Skipping plugin CLI command '%s' because a subcommand "
+                        "with that name already exists",
+                        cmd_info["name"],
+                    )
+                    continue
                 if cmd_info["name"] in seen_plugin_commands:
                     continue
                 plugin_parser = subparsers.add_parser(

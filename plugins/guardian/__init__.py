@@ -40,6 +40,14 @@ _worker_lock = threading.Lock()
 _dropped = 0
 
 
+def _terminal_cwd(path: Path) -> str:
+    """Return a cwd string that Hermes' bash-based terminal can cd into."""
+    text = str(path)
+    if os.name == "nt":
+        return text.replace("\\", "/")
+    return text
+
+
 def _guardian_enabled() -> bool:
     raw = os.environ.get("HERMES_GUARDIAN_ENABLED", "1").strip().lower()
     return raw not in {"0", "false", "no", "off"}
@@ -396,8 +404,10 @@ def _cmd_run_hermes(args) -> int:
     supervisor_id = f"guardian-supervisor-{int(time.time())}-{os.getpid()}"
     daemon_url = (args.dkg_url or _load_daemon_url()).rstrip("/")
     child_home = Path(args.child_home).expanduser() if args.child_home else Path(tempfile.mkdtemp(prefix="guardian-hermes-child-"))
+    workdir = Path(args.workdir).expanduser()
     auto_home = not bool(args.child_home)
     child_home.mkdir(parents=True, exist_ok=True)
+    workdir.mkdir(parents=True, exist_ok=True)
 
     repo_root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
@@ -410,6 +420,7 @@ def _cmd_run_hermes(args) -> int:
         "DKG_DAEMON_URL": daemon_url,
         "GUARDIAN_DKG_DAEMON_URL": daemon_url,
         "HERMES_ENABLE_PROJECT_PLUGINS": env.get("HERMES_ENABLE_PROJECT_PLUGINS", "0"),
+        "TERMINAL_CWD": _terminal_cwd(workdir),
     })
     if args.api_key_env and args.api_key_env in os.environ:
         env["OPENAI_API_KEY"] = os.environ[args.api_key_env]
@@ -449,7 +460,7 @@ def _cmd_run_hermes(args) -> int:
         "data": {
             "childFramework": "hermes",
             "childHome": str(child_home),
-            "workdir": str(Path(args.workdir).expanduser()),
+            "workdir": str(workdir),
             "model": args.model,
             "baseUrl": args.base_url,
             "apiMode": args.api_mode,
@@ -461,7 +472,7 @@ def _cmd_run_hermes(args) -> int:
     print(f"Guardian supervisor: {supervisor_id}")
     print(f"Child HERMES_HOME: {child_home}")
     print(f"DKG daemon: {daemon_url}")
-    proc = subprocess.run(cmd, cwd=str(Path(args.workdir).expanduser()), env=env, text=True)
+    proc = subprocess.run(cmd, cwd=str(workdir), env=env, text=True)
 
     _post_supervisor_event({
         "type": "agent_activity",
