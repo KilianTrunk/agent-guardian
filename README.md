@@ -127,6 +127,7 @@ agent-guardian/
 ├── run_agent.py          # Hermes agent runtime
 ├── model_tools.py        # Tool dispatch and hook invocation
 └── WINDWOS_SETUP.md      # Windows setup guide
+└── setup.md              # Simplified setup guide
 ```
 
 ---
